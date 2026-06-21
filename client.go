@@ -631,6 +631,22 @@ func (c *Client) process(ctx context.Context, pollerID, workerID int64, claim *j
 	}
 }
 
+func (c *Client) ExtendLease(ctx context.Context, jobID int64, workerID int64) error {
+	const renewSQL = `
+	UPDATE "sterling_jobs"
+	SET "claimed_ttl" = "claimed_ttl" + ?
+	WHERE "id" = ? AND "claimed_by" = ? AND "status" = 'claimed';
+	`
+	result, err := c.db.ExecContext(ctx, renewSQL, defaultClaimTTL, jobID, workerID)
+	if err != nil {
+		return fmt.Errorf("failed to extend lease: %w", err)
+	}
+	count, _ := result.RowsAffected()
+	slog.DebugContext(ctx, "Extend Lease", slog.Int64("job-id", jobID), slog.Int64("worker-id", workerID), slog.Int64("rows-affected", count))
+
+	return nil
+}
+
 type contextWorkerID struct{}
 type contextPollerID struct{}
 type contextClient struct{}

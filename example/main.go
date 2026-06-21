@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -31,7 +32,11 @@ func main() {
 	}
 	defer client.Close()
 
-	client.Register("log-event", sterling.ValueWorker(func(ctx context.Context, _ *sterling.Job, message string) error {
+	client.Register("log-event", sterling.ValueWorker(func(ctx context.Context, job *sterling.Job, message string) error {
+		if err := sterling.ExtendLease(ctx, job); err != nil {
+			return err
+		}
+
 		slog.InfoContext(ctx, "Log Event", slog.String("message", message))
 
 		return nil
@@ -105,5 +110,27 @@ func main() {
 
 	if err := eGroup.Wait(); err != nil {
 		slog.ErrorContext(ctx, "error occurred", slog.String("error", err.Error()))
+	}
+
+	queues, err := client.ListQueue(context.Background())
+	if err != nil {
+		panic(err)
+	}
+
+	var results []*sterling.QueueStat
+
+	for _, queue := range queues {
+		stats, err := client.LoadQueueStat(context.Background(), queue)
+		if err != nil {
+			panic(err)
+		}
+
+		results = append(results, stats)
+	}
+
+	enc := json.NewEncoder(os.Stderr)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(results); err != nil {
+		panic(err)
 	}
 }
