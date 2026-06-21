@@ -1,3 +1,7 @@
+// Package sterling provides a SQLite-backed job queue. Jobs are enqueued with
+// Push, processed by registered Workers, and retried automatically on failure.
+// All persistent state lives in a single SQLite database — no external services
+// required.
 package sterling
 
 import (
@@ -22,6 +26,8 @@ const (
 	defaultClaimTTL = 300
 )
 
+// Client is the main entry point for the sterling job queue. Use New to create
+// one, then Register workers and call Run to start processing.
 type Client struct {
 	db            *sql.DB
 	shutdown      func() error
@@ -34,8 +40,12 @@ type Client struct {
 	jobBackoff    func(string, string, int64) time.Duration
 }
 
+// Option configures a Client during New.
 type Option func(context.Context, *Client) error
 
+// WithMemoryClient creates a shared in-memory SQLite database. If name is
+// empty a random name is generated. Multiple clients with the same name share
+// the same in-memory store (useful in tests).
 func WithMemoryClient(name string) Option {
 	if name == "" {
 		random := make([]byte, 8)
@@ -68,10 +78,13 @@ func WithDatabase(db *sql.DB) Option {
 	}
 }
 
+// WithDatabaseFile creates a file-backed SQLite database at path.
 func WithDatabaseFile(path string) Option {
 	return WithDatabaseURL(fmt.Sprintf("file:%s?mode=rwc&cache=shared&_busy_timeout=5000", path))
 }
 
+// WithDatabaseURL opens a SQLite connection using a raw DSN, giving full
+// control over SQLite URI parameters.
 func WithDatabaseURL(url string) Option {
 	return func(ctx context.Context, client *Client) error {
 		if client.db != nil {
@@ -104,6 +117,9 @@ func WithDatabaseURL(url string) Option {
 	}
 }
 
+// New creates and initializes a Client. If no database option is provided it
+// defaults to a random in-memory database. Returns an error if the database
+// cannot be opened or the schema migration fails.
 func New(ctx context.Context, options ...Option) (*Client, error) {
 	if len(options) == 0 {
 		options = append(options, WithMemoryClient(""))
@@ -134,13 +150,15 @@ func New(ctx context.Context, options ...Option) (*Client, error) {
 	return client, nil
 }
 
-// Register a worker to handle jobs of a specific kind
+// Register associates a Worker with a job kind. Jobs whose kind has no
+// registered worker are immediately failed and retried with a 1-minute backoff.
 func (c *Client) Register(kind string, worker Worker) {
 	c.workerMu.Lock()
 	c.workers[kind] = worker
 	c.workerMu.Unlock()
 }
 
+// RegisterFunc is a convenience wrapper around Register for plain functions.
 func (c *Client) RegisterFunc(kind string, worker WorkerFunc) {
 	c.Register(kind, worker)
 }
@@ -161,6 +179,8 @@ func (c *Client) prepare(ctx context.Context) error {
 	return nil
 }
 
+// Push holds the parameters for a single job enqueue operation. Fields are
+// populated by PushOption functions passed to Client.Push.
 type Push struct {
 	Payload   []byte
 	Priority  int
@@ -168,8 +188,10 @@ type Push struct {
 	ExpiresAt time.Time
 }
 
+// PushOption configures a Push before the job is written to the queue.
 type PushOption func(*Push) error
 
+// PushJSON marshals value as JSON and sets it as the job payload.
 func PushJSON(value any) PushOption {
 	return func(p *Push) error {
 		data, err := json.Marshal(value)
@@ -181,6 +203,9 @@ func PushJSON(value any) PushOption {
 	}
 }
 
+// Push enqueues a new job of the given kind onto queue. Options control the
+// payload, priority, visibility delay, and expiry. The queue is created
+// automatically on first use.
 func (c *Client) Push(ctx context.Context, queue, kind string, options ...PushOption) error {
 	var push Push
 	for _, option := range options {
@@ -416,6 +441,10 @@ func (c *Client) claim(ctx context.Context, queues []string, workerID int64) (*j
 	}, nil
 }
 
+// Run starts a poller and the specified number of worker goroutines that
+// process jobs from queues. It blocks until ctx is cancelled or a fatal error
+// occurs. Multiple concurrent calls to Run are safe and each starts an
+// independent poller.
 func (c *Client) Run(ctx context.Context, queues []string, workers int) error {
 	var wait sync.WaitGroup
 	wait.Add(workers)
@@ -498,6 +527,8 @@ func (c *Client) Run(ctx context.Context, queues []string, workers int) error {
 	return nil
 }
 
+// Close shuts down the client and releases the underlying database connection.
+// Only applicable when the client owns the connection (i.e., not WithDatabase).
 func (c *Client) Close() error {
 	if c.shutdown != nil {
 		return c.shutdown()
@@ -506,6 +537,10 @@ func (c *Client) Close() error {
 	return nil
 }
 
+// Cleanup removes stale rows in a single transaction: finished jobs older than
+// one hour, expired pending jobs, and claimed jobs whose TTL has lapsed
+// (returning them to pending with an incremented claim_timeout counter). Run
+// this on a periodic timer to keep the database tidy.
 func (c *Client) Cleanup(ctx context.Context) error {
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -631,6 +666,9 @@ func (c *Client) process(ctx context.Context, pollerID, workerID int64, claim *j
 	}
 }
 
+// ExtendLease adds defaultClaimTTL seconds to the claimed_ttl for the given
+// job, provided it is currently claimed by workerID. Prefer the package-level
+// ExtendLease helper inside worker handlers.
 func (c *Client) ExtendLease(ctx context.Context, jobID int64, workerID int64) error {
 	const renewSQL = `
 	UPDATE "sterling_jobs"
@@ -698,12 +736,16 @@ CREATE TABLE IF NOT EXISTS "sterling_queues" (
 );
 `
 
+// WorkerFunc is a function that implements Worker.
 type WorkerFunc func(context.Context, *Job) error
 
 func (f WorkerFunc) Execute(ctx context.Context, job *Job) error {
 	return f(ctx, job)
 }
 
+// ValueWorker returns a Worker that unmarshals the job's JSON payload into a
+// value of type T before calling handler. Returns an error if unmarshalling
+// fails — the job will be retried according to the backoff policy.
 func ValueWorker[T any](handler func(context.Context, *Job, T) error) Worker {
 	return WorkerFunc(func(ctx context.Context, job *Job) error {
 		var value T

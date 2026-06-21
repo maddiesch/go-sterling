@@ -8,12 +8,14 @@ import (
 	"time"
 )
 
+// QueueStat contains aggregate information about a queue and its job kinds.
 type QueueStat struct {
 	Name      string
 	CreatedAt time.Time           `json:",omitzero"`
 	Jobs      map[string]*JobStat `json:",omitempty"`
 }
 
+// JobStat holds lifetime counters for a single (queue, kind) pair.
 type JobStat struct {
 	Total          int64
 	Finished       int64
@@ -22,6 +24,7 @@ type JobStat struct {
 	LastFailedAt   time.Time `json:",omitzero"`
 }
 
+// ListQueue returns the names of all queues that have ever had a job pushed to them.
 func (c *Client) ListQueue(ctx context.Context) ([]string, error) {
 	slog.DebugContext(ctx, "listing queues")
 
@@ -43,6 +46,7 @@ func (c *Client) ListQueue(ctx context.Context) ([]string, error) {
 	return queues, nil
 }
 
+// LoadQueueStat returns statistics for a queue broken down by job kind.
 func (c *Client) LoadQueueStat(ctx context.Context, queue string) (*QueueStat, error) {
 	var queueCreatedAt int64
 
