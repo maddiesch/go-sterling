@@ -41,9 +41,10 @@ jobs:
         with:
           go-version-file: go.mod
       - run: go test -coverprofile=coverage.txt ./... -timeout 2m
-      - uses: codecov/codecov-action@v4
+      - uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+          slug: maddiesch/go-sterling
   code-formatting:
     runs-on: ubuntu-latest
     steps:
