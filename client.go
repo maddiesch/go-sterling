@@ -31,6 +31,7 @@ type Client struct {
 	pollerID      atomic.Int64
 	pollerBackoff time.Duration
 	maxAttempts   int
+	jobBackoff    func(string, string, int64) time.Duration
 }
 
 type Option func(context.Context, *Client) error
@@ -112,6 +113,9 @@ func New(ctx context.Context, options ...Option) (*Client, error) {
 	client.workers = make(map[string]Worker)
 	client.pollerBackoff = 1 * time.Second
 	client.maxAttempts = 10
+	client.jobBackoff = func(_, _ string, attempt int64) time.Duration {
+		return time.Duration(attempt) * time.Minute
+	}
 
 	for _, option := range options {
 		if err := option(ctx, client); err != nil {
@@ -164,12 +168,25 @@ type Push struct {
 	ExpiresAt time.Time
 }
 
-type PushOption func(*Push)
+type PushOption func(*Push) error
+
+func PushJSON(value any) PushOption {
+	return func(p *Push) error {
+		data, err := json.Marshal(value)
+		if err != nil {
+			return fmt.Errorf("failed to marshal JSON: %w", err)
+		}
+		p.Payload = data
+		return nil
+	}
+}
 
 func (c *Client) Push(ctx context.Context, queue, kind string, options ...PushOption) error {
 	var push Push
 	for _, option := range options {
-		option(&push)
+		if err := option(&push); err != nil {
+			return fmt.Errorf("failed to apply push option: %w", err)
+		}
 	}
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -222,6 +239,8 @@ func (c *Client) Push(ctx context.Context, queue, kind string, options ...PushOp
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
+
+	slog.DebugContext(ctx, "Push", slog.String("queue", queue), slog.String("kind", kind))
 
 	return nil
 }
@@ -312,8 +331,10 @@ func (c *Client) fail(ctx context.Context, jobID int64, timeout time.Duration, i
 
 type jobClaim struct {
 	ID      int64
+	Queue   string
 	Kind    string
 	Payload []byte
+	Attempt int64
 }
 
 func (c *Client) claim(ctx context.Context, queues []string, workerID int64) (*jobClaim, error) {
@@ -355,8 +376,8 @@ func (c *Client) claim(ctx context.Context, queues []string, workerID int64) (*j
 				"claimed_by" = ?,
 				"claimed_ttl" = ?,
 				"current_attempt" = "current_attempt" + 1
-	WHERE id = (SELECT id FROM candidates)
-	RETURNING id, kind, payload;
+	WHERE "id" = (SELECT "id" FROM candidates)
+	RETURNING "id", "queue", "kind", "payload", "current_attempt";
 	`, placeholders)
 
 	args := make([]any, 0, len(queues)+2)
@@ -368,10 +389,12 @@ func (c *Client) claim(ctx context.Context, queues []string, workerID int64) (*j
 	row := tx.QueryRowContext(ctx, claimSQL, args...)
 	var (
 		jobID   int64
+		queue   string
 		kind    string
 		payload []byte
+		attempt int64
 	)
-	if err := row.Scan(&jobID, &kind, &payload); err != nil {
+	if err := row.Scan(&jobID, &queue, &kind, &payload, &attempt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
@@ -386,8 +409,10 @@ func (c *Client) claim(ctx context.Context, queues []string, workerID int64) (*j
 
 	return &jobClaim{
 		ID:      jobID,
+		Queue:   queue,
 		Kind:    kind,
 		Payload: payload,
+		Attempt: attempt,
 	}, nil
 }
 
@@ -405,6 +430,9 @@ func (c *Client) Run(ctx context.Context, queues []string, workers int) error {
 	go func() {
 		defer close(jobChan)
 		defer cancel(nil)
+
+		slog.DebugContext(ctx, "Starting Poller", slog.Int64("poller-id", pollerID), slog.String("queues", strings.Join(queues, ",")))
+		defer slog.DebugContext(ctx, "Stopping Poller", slog.Int64("poller-id", pollerID))
 
 		for {
 			select {
@@ -436,12 +464,15 @@ func (c *Client) Run(ctx context.Context, queues []string, workers int) error {
 		}
 	}()
 
-	for i := 0; i < workers; i++ {
+	for range workers {
 		go func() {
 			defer wait.Done()
 
 			workerID := c.workerID.Add(1)
 			wCtx := context.WithValue(pCtx, contextWorkerID{}, workerID)
+
+			slog.DebugContext(ctx, "Starting Worker", slog.Int64("poller-id", pollerID), slog.Int64("worker-id", workerID))
+			defer slog.DebugContext(ctx, "Stopping Worker", slog.Int64("poller-id", pollerID), slog.Int64("worker-id", workerID))
 
 			for {
 				select {
@@ -582,14 +613,16 @@ func (c *Client) process(ctx context.Context, pollerID, workerID int64, claim *j
 		ID:      claim.ID,
 		Kind:    claim.Kind,
 		Payload: claim.Payload,
+		Attempt: claim.Attempt,
 	}
 	err := worker.Execute(ctx, job)
 
 	if err != nil {
 		slog.ErrorContext(ctx, "Worker failed to execute job", slog.Int64("job-id", claim.ID), slog.String("error", err.Error()))
 
-		if err := c.fail(ctx, claim.ID, 1*time.Minute, err.Error()); err != nil {
-			slog.ErrorContext(ctx, "Failed to mark job as failed", slog.Int64("job-id", claim.ID), slog.String("error", err.Error()))
+		timeout := c.jobBackoff(claim.Queue, claim.Kind, claim.Attempt)
+		if err := c.fail(ctx, claim.ID, timeout, err.Error()); err != nil {
+			slog.ErrorContext(ctx, "Failed to mark job as failed", slog.Duration("timeout", timeout), slog.Int64("job-id", claim.ID), slog.String("error", err.Error()))
 		}
 	} else {
 		if err := c.finish(ctx, claim.ID); err != nil {
