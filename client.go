@@ -355,11 +355,12 @@ func (c *Client) fail(ctx context.Context, jobID int64, timeout time.Duration, i
 }
 
 type jobClaim struct {
-	ID      int64
-	Queue   string
-	Kind    string
-	Payload []byte
-	Attempt int64
+	ID        int64
+	Queue     string
+	Kind      string
+	Payload   []byte
+	Attempt   int64
+	CreatedAt time.Time
 }
 
 func (c *Client) claim(ctx context.Context, queues []string, workerID int64) (*jobClaim, error) {
@@ -402,7 +403,7 @@ func (c *Client) claim(ctx context.Context, queues []string, workerID int64) (*j
 				"claimed_ttl" = ?,
 				"current_attempt" = "current_attempt" + 1
 	WHERE "id" = (SELECT "id" FROM candidates)
-	RETURNING "id", "queue", "kind", "payload", "current_attempt";
+	RETURNING "id", "queue", "kind", "payload", "current_attempt", "created_at";
 	`, placeholders)
 
 	args := make([]any, 0, len(queues)+2)
@@ -413,13 +414,14 @@ func (c *Client) claim(ctx context.Context, queues []string, workerID int64) (*j
 
 	row := tx.QueryRowContext(ctx, claimSQL, args...)
 	var (
-		jobID   int64
-		queue   string
-		kind    string
-		payload []byte
-		attempt int64
+		jobID     int64
+		queue     string
+		kind      string
+		payload   []byte
+		attempt   int64
+		createdAt int64
 	)
-	if err := row.Scan(&jobID, &queue, &kind, &payload, &attempt); err != nil {
+	if err := row.Scan(&jobID, &queue, &kind, &payload, &attempt, &createdAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
@@ -433,11 +435,12 @@ func (c *Client) claim(ctx context.Context, queues []string, workerID int64) (*j
 	committed = true
 
 	return &jobClaim{
-		ID:      jobID,
-		Queue:   queue,
-		Kind:    kind,
-		Payload: payload,
-		Attempt: attempt,
+		ID:        jobID,
+		Queue:     queue,
+		Kind:      kind,
+		Payload:   payload,
+		Attempt:   attempt,
+		CreatedAt: time.Unix(createdAt, 0),
 	}, nil
 }
 
@@ -667,10 +670,11 @@ func (c *Client) process(ctx context.Context, _, _ int64, claim *jobClaim) {
 	}
 
 	job := &Job{
-		ID:      claim.ID,
-		Kind:    claim.Kind,
-		Payload: claim.Payload,
-		Attempt: claim.Attempt,
+		ID:        claim.ID,
+		Kind:      claim.Kind,
+		Payload:   claim.Payload,
+		Attempt:   claim.Attempt,
+		CreatedAt: claim.CreatedAt,
 	}
 	err := worker.Execute(ctx, job)
 
