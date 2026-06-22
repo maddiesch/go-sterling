@@ -73,7 +73,7 @@ func main() {
 				}
 
 				if count%5 == 0 {
-					options = append(options, func(p *sterling.Push) error {
+					options = append(options, func(p *sterling.PushPayload) error {
 						p.VisibleAt = time.Now().Add(2 * time.Minute)
 						return nil
 					})
