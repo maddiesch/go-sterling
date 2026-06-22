@@ -5,7 +5,6 @@ go 1.26.3
 require (
 	github.com/mattn/go-sqlite3 v1.14.47
 	github.com/stretchr/testify v1.11.1
-	golang.org/x/sync v0.21.0
 )
 
 require (
