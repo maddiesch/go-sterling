@@ -631,7 +631,29 @@ func (c *Client) sweepExpiredClaims(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
-func (c *Client) process(ctx context.Context, pollerID, workerID int64, claim *jobClaim) {
+// Step performs a single claim and process for the specified queues
+// **Note:** This is not meant to be used in production. Use Run instead to start a poller and worker goroutines that continuously process jobs. Step is primarily intended for testing and debugging purposes, allowing you to process one job at a time in a controlled manner.
+func (c *Client) Step(ctx context.Context, queues []string) error {
+	workerID := c.workerID.Add(1)
+
+	claim, err := c.claim(ctx, queues, workerID)
+	if err != nil {
+		return fmt.Errorf("failed to claim job: %w", err)
+	}
+	if claim == nil {
+		return nil
+	}
+
+	ctx = context.WithValue(ctx, contextPollerID{}, -1)
+	ctx = context.WithValue(ctx, contextWorkerID{}, workerID)
+	ctx = context.WithValue(ctx, contextClient{}, c)
+
+	c.process(ctx, -1, workerID, claim)
+
+	return nil
+}
+
+func (c *Client) process(ctx context.Context, _, _ int64, claim *jobClaim) {
 	c.workerMu.RLock()
 	worker, ok := c.workers[claim.Kind]
 	c.workerMu.RUnlock()
