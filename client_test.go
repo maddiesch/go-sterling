@@ -114,7 +114,7 @@ func TestClientCleanup(t *testing.T) {
 	})
 
 	t.Run("cleanup removes expired pending jobs", func(t *testing.T) {
-		opt := sterling.PushOption(func(p *sterling.Push) error {
+		opt := sterling.PushOption(func(p *sterling.PushPayload) error {
 			p.ExpiresAt = time.Now().Add(-time.Hour)
 			return nil
 		})
@@ -177,7 +177,7 @@ func TestPushOptions(t *testing.T) {
 	t.Cleanup(func() { client.Close() })
 
 	t.Run("push with visible at", func(t *testing.T) {
-		opt := sterling.PushOption(func(p *sterling.Push) error {
+		opt := sterling.PushOption(func(p *sterling.PushPayload) error {
 			p.VisibleAt = time.Now().Add(time.Hour)
 			return nil
 		})
@@ -186,7 +186,7 @@ func TestPushOptions(t *testing.T) {
 	})
 
 	t.Run("push with expires at", func(t *testing.T) {
-		opt := sterling.PushOption(func(p *sterling.Push) error {
+		opt := sterling.PushOption(func(p *sterling.PushPayload) error {
 			p.ExpiresAt = time.Now().Add(time.Hour)
 			return nil
 		})
@@ -195,7 +195,7 @@ func TestPushOptions(t *testing.T) {
 	})
 
 	t.Run("push with priority", func(t *testing.T) {
-		opt := sterling.PushOption(func(p *sterling.Push) error {
+		opt := sterling.PushOption(func(p *sterling.PushPayload) error {
 			p.Priority = 10
 			return nil
 		})

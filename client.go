@@ -43,6 +43,10 @@ type Client struct {
 // Option configures a Client during New.
 type Option func(context.Context, *Client) error
 
+type Executor interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
 // WithMemoryClient creates a shared in-memory SQLite database. If name is
 // empty a random name is generated. Multiple clients with the same name share
 // the same in-memory store (useful in tests).
@@ -179,21 +183,21 @@ func (c *Client) prepare(ctx context.Context) error {
 	return nil
 }
 
-// Push holds the parameters for a single job enqueue operation. Fields are
+// PushPayload holds the parameters for a single job enqueue operation. Fields are
 // populated by PushOption functions passed to Client.Push.
-type Push struct {
+type PushPayload struct {
 	Payload   []byte
 	Priority  int
 	VisibleAt time.Time
 	ExpiresAt time.Time
 }
 
-// PushOption configures a Push before the job is written to the queue.
-type PushOption func(*Push) error
+// PushOption configures a PushPayload before the job is written to the queue.
+type PushOption func(*PushPayload) error
 
 // PushJSON marshals value as JSON and sets it as the job payload.
 func PushJSON(value any) PushOption {
-	return func(p *Push) error {
+	return func(p *PushPayload) error {
 		data, err := json.Marshal(value)
 		if err != nil {
 			return fmt.Errorf("failed to marshal JSON: %w", err)
@@ -207,17 +211,32 @@ func PushJSON(value any) PushOption {
 // payload, priority, visibility delay, and expiry. The queue is created
 // automatically on first use.
 func (c *Client) Push(ctx context.Context, queue, kind string, options ...PushOption) error {
-	var push Push
-	for _, option := range options {
-		if err := option(&push); err != nil {
-			return fmt.Errorf("failed to apply push option: %w", err)
-		}
-	}
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
+
+	if err := Push(ctx, tx, queue, kind, options...); err != nil {
+		return fmt.Errorf("failed to push job: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return nil
+}
+
+// Push enqueues a new job of the given kind onto queue using the provided Executor.
+// Useful to push a job within an existing transaction.
+func Push(ctx context.Context, db Executor, queue, kind string, options ...PushOption) error {
+	var push PushPayload
+	for _, option := range options {
+		if err := option(&push); err != nil {
+			return fmt.Errorf("failed to apply push option: %w", err)
+		}
+	}
 
 	const insertQueueSQL = `
 	INSERT OR IGNORE INTO "sterling_queues" ("name") VALUES (?);
@@ -249,20 +268,16 @@ func (c *Client) Push(ctx context.Context, queue, kind string, options ...PushOp
 	ON CONFLICT ("queue", "kind") DO UPDATE SET "total_jobs" = "total_jobs" + 1;
 	`
 
-	if _, err := tx.ExecContext(ctx, insertQueueSQL, queue); err != nil {
+	if _, err := db.ExecContext(ctx, insertQueueSQL, queue); err != nil {
 		return fmt.Errorf("failed to insert queue: %w", err)
 	}
 
-	if _, err := tx.ExecContext(ctx, insertJobSQL, values...); err != nil {
+	if _, err := db.ExecContext(ctx, insertJobSQL, values...); err != nil {
 		return fmt.Errorf("failed to insert job: %w", err)
 	}
 
-	if _, err := tx.ExecContext(ctx, insertStatsSQL, queue, kind); err != nil {
+	if _, err := db.ExecContext(ctx, insertStatsSQL, queue, kind); err != nil {
 		return fmt.Errorf("failed to insert job stats: %w", err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
 	slog.DebugContext(ctx, "Push", slog.String("queue", queue), slog.String("kind", kind))
