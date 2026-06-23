@@ -530,7 +530,7 @@ func (c *Client) Run(ctx context.Context, queues []string, workers int) error {
 						return
 					}
 
-					c.process(wCtx, pollerID, workerID, job)
+					_ = c.process(wCtx, pollerID, workerID, job)
 				}
 			}
 		}()
@@ -666,12 +666,10 @@ func (c *Client) Step(ctx context.Context, queues []string) error {
 	ctx = context.WithValue(ctx, contextWorkerID{}, workerID)
 	ctx = context.WithValue(ctx, contextClient{}, c)
 
-	c.process(ctx, -1, workerID, claim)
-
-	return nil
+	return c.process(ctx, -1, workerID, claim)
 }
 
-func (c *Client) process(ctx context.Context, _, _ int64, claim *jobClaim) {
+func (c *Client) process(ctx context.Context, _, _ int64, claim *jobClaim) error {
 	c.workerMu.RLock()
 	worker, ok := c.workers[claim.Kind]
 	c.workerMu.RUnlock()
@@ -681,7 +679,7 @@ func (c *Client) process(ctx context.Context, _, _ int64, claim *jobClaim) {
 		if err := c.fail(ctx, claim.ID, time.Minute, "no worker registered for job kind"); err != nil {
 			slog.ErrorContext(ctx, "Failed to mark job as failed", slog.Int64("job_id", claim.ID), slog.String("error", err.Error()))
 		}
-		return
+		return fmt.Errorf("no worker registered for job kind: %s", claim.Kind)
 	}
 
 	job := &Job{
@@ -700,11 +698,16 @@ func (c *Client) process(ctx context.Context, _, _ int64, claim *jobClaim) {
 		if err := c.fail(ctx, claim.ID, timeout, err.Error()); err != nil {
 			slog.ErrorContext(ctx, "Failed to mark job as failed", slog.Duration("timeout", timeout), slog.Int64("job-id", claim.ID), slog.String("error", err.Error()))
 		}
-	} else {
-		if err := c.finish(ctx, claim.ID); err != nil {
-			slog.ErrorContext(ctx, "Failed to mark job as finished", slog.Int64("job-id", claim.ID), slog.String("error", err.Error()))
-		}
+
+		return fmt.Errorf("worker failed to execute job: %w", err)
 	}
+
+	if err := c.finish(ctx, claim.ID); err != nil {
+		slog.ErrorContext(ctx, "Failed to mark job as finished", slog.Int64("job-id", claim.ID), slog.String("error", err.Error()))
+		return fmt.Errorf("failed to mark job as finished: %w", err)
+	}
+
+	return nil
 }
 
 // ExtendLease adds defaultClaimTTL seconds to the claimed_ttl for the given

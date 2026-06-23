@@ -420,20 +420,22 @@ func TestStep(t *testing.T) {
 		assert.Equal(t, int64(1), executed.Load())
 	})
 
-	t.Run("worker error does not propagate", func(t *testing.T) {
+	t.Run("worker error is returned from Step", func(t *testing.T) {
 		client, err := sterling.New(t.Context(), sterling.WithMemoryClient(t.Name()))
 		require.NoError(t, err)
 		t.Cleanup(func() { client.Close() })
 
+		workerErr := errors.New("intentional failure")
+
 		client.RegisterFunc("failing-step-job", func(_ context.Context, _ *sterling.Job) error {
-			return errors.New("intentional failure")
+			return workerErr
 		})
 
 		err = client.Push(t.Context(), "default", "failing-step-job")
 		require.NoError(t, err)
 
 		err = client.Step(t.Context(), []string{"default"})
-		assert.NoError(t, err)
+		assert.Equal(t, workerErr, errors.Unwrap(err))
 	})
 
 	t.Run("context has client for ExtendLease", func(t *testing.T) {
