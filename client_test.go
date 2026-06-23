@@ -458,6 +458,95 @@ func TestStep(t *testing.T) {
 	})
 }
 
+func TestDrain(t *testing.T) {
+	t.Run("empty queue returns nil", func(t *testing.T) {
+		client, err := sterling.New(t.Context(), sterling.WithMemoryClient(t.Name()))
+		require.NoError(t, err)
+		t.Cleanup(func() { client.Close() })
+
+		err = client.Drain(t.Context(), []string{"default"})
+		assert.NoError(t, err)
+	})
+
+	t.Run("processes all pending jobs", func(t *testing.T) {
+		client, err := sterling.New(t.Context(), sterling.WithMemoryClient(t.Name()))
+		require.NoError(t, err)
+		t.Cleanup(func() { client.Close() })
+
+		var executed atomic.Int64
+		client.RegisterFunc("drain-job", func(_ context.Context, _ *sterling.Job) error {
+			executed.Add(1)
+			return nil
+		})
+
+		for range 5 {
+			err = client.Push(t.Context(), "default", "drain-job")
+			require.NoError(t, err)
+		}
+
+		err = client.Drain(t.Context(), []string{"default"})
+		assert.NoError(t, err)
+		assert.Equal(t, int64(5), executed.Load())
+	})
+
+	t.Run("worker error is returned", func(t *testing.T) {
+		client, err := sterling.New(t.Context(), sterling.WithMemoryClient(t.Name()))
+		require.NoError(t, err)
+		t.Cleanup(func() { client.Close() })
+
+		workerErr := errors.New("drain failure")
+		client.RegisterFunc("failing-drain-job", func(_ context.Context, _ *sterling.Job) error {
+			return workerErr
+		})
+
+		err = client.Push(t.Context(), "default", "failing-drain-job")
+		require.NoError(t, err)
+
+		err = client.Drain(t.Context(), []string{"default"})
+		assert.Equal(t, workerErr, errors.Unwrap(errors.Unwrap(err)))
+	})
+
+	t.Run("only drains specified queues", func(t *testing.T) {
+		client, err := sterling.New(t.Context(), sterling.WithMemoryClient(t.Name()))
+		require.NoError(t, err)
+		t.Cleanup(func() { client.Close() })
+
+		var executed atomic.Int64
+		client.RegisterFunc("queue-scoped-job", func(_ context.Context, _ *sterling.Job) error {
+			executed.Add(1)
+			return nil
+		})
+
+		err = client.Push(t.Context(), "target", "queue-scoped-job")
+		require.NoError(t, err)
+		err = client.Push(t.Context(), "other", "queue-scoped-job")
+		require.NoError(t, err)
+
+		err = client.Drain(t.Context(), []string{"target"})
+		assert.NoError(t, err)
+		assert.Equal(t, int64(1), executed.Load())
+	})
+
+	t.Run("context has client for ExtendLease", func(t *testing.T) {
+		client, err := sterling.New(t.Context(), sterling.WithMemoryClient(t.Name()))
+		require.NoError(t, err)
+		t.Cleanup(func() { client.Close() })
+
+		var extendErr error
+		client.RegisterFunc("extend-lease-drain", func(ctx context.Context, job *sterling.Job) error {
+			extendErr = sterling.ExtendLease(ctx, job)
+			return nil
+		})
+
+		err = client.Push(t.Context(), "default", "extend-lease-drain")
+		require.NoError(t, err)
+
+		err = client.Drain(t.Context(), []string{"default"})
+		assert.NoError(t, err)
+		assert.NoError(t, extendErr)
+	})
+}
+
 func BenchmarkPush(b *testing.B) {
 	b.Run("with in-memory database", func(b *testing.B) {
 		client, err := sterling.New(b.Context(), sterling.WithMemoryClient("benchmark-push"))

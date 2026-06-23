@@ -19,6 +19,7 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: ${{ matrix.go-version }}
+      - run: go mod download
       - run: go test -v -race ./... -timeout 2m
   build:
     runs-on: ${{ matrix.os }}
@@ -31,6 +32,7 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: ${{ matrix.go-version }}
+      - run: go mod download
       - run: go build ./...
   coverage:
     runs-on: ubuntu-latest
