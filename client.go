@@ -649,6 +649,7 @@ func (c *Client) sweepExpiredClaims(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
+// Drain processes all available jobs from the specified queues until none remain. It blocks until all jobs are processed or ctx is cancelled. This is primarily intended for testing and debugging purposes, allowing you to process all jobs in a controlled manner.
 func (c *Client) Drain(ctx context.Context, queues []string) error {
 	workerID := c.workerID.Add(1)
 
