@@ -186,14 +186,24 @@ func (c *Client) prepare(ctx context.Context) error {
 // PushPayload holds the parameters for a single job enqueue operation. Fields are
 // populated by PushOption functions passed to Client.Push.
 type PushPayload struct {
-	Payload   []byte
-	Priority  int
-	VisibleAt time.Time
-	ExpiresAt time.Time
+	Payload        []byte
+	Priority       int
+	VisibleAt      time.Time
+	ExpiresAt      time.Time
+	IdempotencyKey string
 }
 
 // PushOption configures a PushPayload before the job is written to the queue.
 type PushOption func(*PushPayload) error
+
+// WithIdempotencyKey sets a deduplication key on the job. If a non-finished
+// job with the same queue and key already exists, Push skips the insert.
+func WithIdempotencyKey(key string) PushOption {
+	return func(p *PushPayload) error {
+		p.IdempotencyKey = key
+		return nil
+	}
+}
 
 // PushJSON marshals value as JSON and sets it as the job payload.
 func PushJSON(value any) PushOption {
@@ -242,26 +252,54 @@ func Push(ctx context.Context, db Executor, queue, kind string, options ...PushO
 	INSERT OR IGNORE INTO "sterling_queues" ("name") VALUES (?);
 	`
 
-	columns := []string{`"status"`, `"queue"`, `"kind"`, `"payload"`, `"priority"`}
-	arguments := []string{`'pending'`, `?`, `?`, `?`, `?`}
-	values := []any{
-		queue,
-		kind,
-		push.Payload,
-		push.Priority,
+	type col struct {
+		name string
+		arg  string
+		val  any
+	}
+	cols := []col{
+		{`"status"`, `'pending'`, nil},
+		{`"queue"`, `?`, queue},
+		{`"kind"`, `?`, kind},
+		{`"payload"`, `?`, push.Payload},
+		{`"priority"`, `?`, push.Priority},
 	}
 	if !push.VisibleAt.IsZero() {
-		columns = append(columns, `"visible_at"`)
-		arguments = append(arguments, `?`)
-		values = append(values, push.VisibleAt.Unix())
+		cols = append(cols, col{`"visible_at"`, `?`, push.VisibleAt.Unix()})
 	}
 	if !push.ExpiresAt.IsZero() {
-		columns = append(columns, `"expires_at"`)
-		arguments = append(arguments, `?`)
-		values = append(values, push.ExpiresAt.Unix())
+		cols = append(cols, col{`"expires_at"`, `?`, push.ExpiresAt.Unix()})
 	}
 
-	var insertJobSQL = fmt.Sprintf(`INSERT INTO "sterling_jobs" (%s) VALUES (%s);`, strings.Join(columns, ", "), strings.Join(arguments, ", "))
+	insertVerb := "INSERT"
+	if push.IdempotencyKey != "" {
+		cols = append(cols, col{`"idempotency_key"`, `?`, push.IdempotencyKey})
+		insertVerb = "INSERT OR IGNORE"
+	}
+
+	values := make([]any, 0, len(cols))
+	var b strings.Builder
+	b.WriteString(insertVerb)
+	b.WriteString(` INTO "sterling_jobs" (`)
+	for i, c := range cols {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(c.name)
+		if c.val != nil {
+			values = append(values, c.val)
+		}
+	}
+	b.WriteString(`) VALUES (`)
+	for i, c := range cols {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(c.arg)
+	}
+	b.WriteString(`);`)
+
+	insertJobSQL := b.String()
 
 	const insertStatsSQL = `
 	INSERT INTO "sterling_job_stats" ("queue", "kind", "total_jobs") VALUES (?, ?, 1)
@@ -272,8 +310,14 @@ func Push(ctx context.Context, db Executor, queue, kind string, options ...PushO
 		return fmt.Errorf("failed to insert queue: %w", err)
 	}
 
-	if _, err := db.ExecContext(ctx, insertJobSQL, values...); err != nil {
+	result, err := db.ExecContext(ctx, insertJobSQL, values...)
+	if err != nil {
 		return fmt.Errorf("failed to insert job: %w", err)
+	}
+
+	if rows, _ := result.RowsAffected(); rows == 0 {
+		slog.DebugContext(ctx, "Push skipped (duplicate idempotency key)", slog.String("queue", queue), slog.String("kind", kind))
+		return nil
 	}
 
 	if _, err := db.ExecContext(ctx, insertStatsSQL, queue, kind); err != nil {
@@ -762,6 +806,7 @@ CREATE TABLE IF NOT EXISTS "sterling_jobs" (
 	"kind" TEXT NOT NULL,
 	"payload" BLOB,
 	"priority" INTEGER NOT NULL DEFAULT 0,
+	"idempotency_key" TEXT,
 	"created_at" INTEGER NOT NULL DEFAULT (unixepoch()),
 	"visible_at" INTEGER NOT NULL DEFAULT (unixepoch()),
 	"current_attempt" INTEGER NOT NULL DEFAULT 0,
@@ -775,9 +820,10 @@ CREATE TABLE IF NOT EXISTS "sterling_jobs" (
 );
 
 CREATE INDEX IF NOT EXISTS "idx_sterling_jobs_queue_status" ON "sterling_jobs" ("queue", "status", "expires_at", "visible_at", "priority");
-CREATE INDEX IF NOT EXISTS "idx_sterling_jobs_status" ON "sterling_jobs" ("status", "claimed_at");
-CREATE INDEX IF NOT EXISTS "idx_sterling_jobs_status" ON "sterling_jobs" ("status", "finished_at");
+CREATE INDEX IF NOT EXISTS "idx_sterling_jobs_status_claimed" ON "sterling_jobs" ("status", "claimed_at");
+CREATE INDEX IF NOT EXISTS "idx_sterling_jobs_status_finished" ON "sterling_jobs" ("status", "finished_at");
 CREATE INDEX IF NOT EXISTS "idx_sterling_jobs_expires" ON "sterling_jobs" ("expires_at");
+CREATE UNIQUE INDEX IF NOT EXISTS "idx_sterling_jobs_idempotency" ON "sterling_jobs" ("queue", "idempotency_key") WHERE "idempotency_key" IS NOT NULL AND "status" != 'finished';
 `
 
 const createJobStatsTableSQL = `

@@ -547,6 +547,99 @@ func TestDrain(t *testing.T) {
 	})
 }
 
+func TestWithIdempotencyKey(t *testing.T) {
+	t.Run("duplicate push is skipped", func(t *testing.T) {
+		client, err := sterling.New(t.Context(), sterling.WithMemoryClient(t.Name()))
+		require.NoError(t, err)
+		t.Cleanup(func() { client.Close() })
+
+		var executed atomic.Int64
+		client.RegisterFunc("idem-job", func(_ context.Context, _ *sterling.Job) error {
+			executed.Add(1)
+			return nil
+		})
+
+		key := sterling.WithIdempotencyKey("key-1")
+		require.NoError(t, client.Push(t.Context(), "default", "idem-job", key))
+		require.NoError(t, client.Push(t.Context(), "default", "idem-job", key))
+
+		require.NoError(t, client.Drain(t.Context(), []string{"default"}))
+		assert.Equal(t, int64(1), executed.Load())
+	})
+
+	t.Run("same key on different queues both enqueue", func(t *testing.T) {
+		client, err := sterling.New(t.Context(), sterling.WithMemoryClient(t.Name()))
+		require.NoError(t, err)
+		t.Cleanup(func() { client.Close() })
+
+		var executed atomic.Int64
+		client.RegisterFunc("idem-job", func(_ context.Context, _ *sterling.Job) error {
+			executed.Add(1)
+			return nil
+		})
+
+		key := sterling.WithIdempotencyKey("shared-key")
+		require.NoError(t, client.Push(t.Context(), "queue-a", "idem-job", key))
+		require.NoError(t, client.Push(t.Context(), "queue-b", "idem-job", key))
+
+		require.NoError(t, client.Drain(t.Context(), []string{"queue-a", "queue-b"}))
+		assert.Equal(t, int64(2), executed.Load())
+	})
+
+	t.Run("key can be reused after job finishes", func(t *testing.T) {
+		client, err := sterling.New(t.Context(), sterling.WithMemoryClient(t.Name()))
+		require.NoError(t, err)
+		t.Cleanup(func() { client.Close() })
+
+		var executed atomic.Int64
+		client.RegisterFunc("idem-job", func(_ context.Context, _ *sterling.Job) error {
+			executed.Add(1)
+			return nil
+		})
+
+		key := sterling.WithIdempotencyKey("reuse-key")
+		require.NoError(t, client.Push(t.Context(), "default", "idem-job", key))
+		require.NoError(t, client.Drain(t.Context(), []string{"default"}))
+		assert.Equal(t, int64(1), executed.Load())
+
+		require.NoError(t, client.Push(t.Context(), "default", "idem-job", key))
+		require.NoError(t, client.Drain(t.Context(), []string{"default"}))
+		assert.Equal(t, int64(2), executed.Load())
+	})
+
+	t.Run("skipped push does not increment stats", func(t *testing.T) {
+		client, err := sterling.New(t.Context(), sterling.WithMemoryClient(t.Name()))
+		require.NoError(t, err)
+		t.Cleanup(func() { client.Close() })
+
+		key := sterling.WithIdempotencyKey("stats-key")
+		require.NoError(t, client.Push(t.Context(), "default", "idem-job", key))
+		require.NoError(t, client.Push(t.Context(), "default", "idem-job", key))
+
+		stat, err := client.LoadQueueStat(t.Context(), "default")
+		require.NoError(t, err)
+		assert.Equal(t, int64(1), stat.Jobs["idem-job"].Total)
+	})
+
+	t.Run("no key allows duplicate pushes", func(t *testing.T) {
+		client, err := sterling.New(t.Context(), sterling.WithMemoryClient(t.Name()))
+		require.NoError(t, err)
+		t.Cleanup(func() { client.Close() })
+
+		var executed atomic.Int64
+		client.RegisterFunc("idem-job", func(_ context.Context, _ *sterling.Job) error {
+			executed.Add(1)
+			return nil
+		})
+
+		require.NoError(t, client.Push(t.Context(), "default", "idem-job"))
+		require.NoError(t, client.Push(t.Context(), "default", "idem-job"))
+
+		require.NoError(t, client.Drain(t.Context(), []string{"default"}))
+		assert.Equal(t, int64(2), executed.Load())
+	})
+}
+
 func BenchmarkPush(b *testing.B) {
 	b.Run("with in-memory database", func(b *testing.B) {
 		client, err := sterling.New(b.Context(), sterling.WithMemoryClient("benchmark-push"))
