@@ -735,9 +735,9 @@ func (c *Client) step(ctx context.Context, queues []string, pollerID, workerID i
 }
 
 func (c *Client) process(ctx context.Context, _, _ int64, claim *jobClaim) error {
-	worker, ok := c.WorkerFor(claim.Kind)
+	worker, _ := c.WorkerFor(claim.Kind)
 
-	if !ok {
+	if worker == nil {
 		slog.ErrorContext(ctx, "No worker registered for job kind", slog.String("kind", claim.Kind))
 		if err := c.fail(ctx, claim.ID, time.Minute, "no worker registered for job kind"); err != nil {
 			slog.ErrorContext(ctx, "Failed to mark job as failed", slog.Int64("job_id", claim.ID), slog.String("error", err.Error()))
