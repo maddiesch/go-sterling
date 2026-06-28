@@ -735,9 +735,7 @@ func (c *Client) step(ctx context.Context, queues []string, pollerID, workerID i
 }
 
 func (c *Client) process(ctx context.Context, _, _ int64, claim *jobClaim) error {
-	c.workerMu.RLock()
-	worker, ok := c.workers[claim.Kind]
-	c.workerMu.RUnlock()
+	worker, ok := c.WorkerFor(claim.Kind)
 
 	if !ok {
 		slog.ErrorContext(ctx, "No worker registered for job kind", slog.String("kind", claim.Kind))
@@ -773,6 +771,14 @@ func (c *Client) process(ctx context.Context, _, _ int64, claim *jobClaim) error
 	}
 
 	return nil
+}
+
+func (c *Client) WorkerFor(kind string) (Worker, bool) {
+	c.workerMu.RLock()
+	w, ok := c.workers[kind]
+	c.workerMu.RUnlock()
+
+	return w, ok
 }
 
 // ExtendLease adds defaultClaimTTL seconds to the claimed_ttl for the given
