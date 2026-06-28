@@ -775,8 +775,13 @@ func (c *Client) process(ctx context.Context, _, _ int64, claim *jobClaim) error
 
 func (c *Client) WorkerFor(kind string) (Worker, bool) {
 	c.workerMu.RLock()
+	defer c.workerMu.RUnlock()
+
+	if c.workers == nil {
+		return nil, false
+	}
+
 	w, ok := c.workers[kind]
-	c.workerMu.RUnlock()
 
 	return w, ok
 }
