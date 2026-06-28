@@ -23,7 +23,8 @@ import (
 )
 
 const (
-	defaultClaimTTL = 300
+	defaultClaimTTL    = 300
+	defaultMaxAttempts = 10
 )
 
 // Client is the main entry point for the sterling job queue. Use New to create
@@ -37,7 +38,7 @@ type Client struct {
 	pollerID      atomic.Int64
 	pollerBackoff time.Duration
 	maxAttempts   int
-	jobBackoff    func(string, string, int64) time.Duration
+	jobBackoff    func(Worker, string, string, int64) time.Duration
 }
 
 // Option configures a Client during New.
@@ -121,6 +122,18 @@ func WithDatabaseURL(url string) Option {
 	}
 }
 
+func defaultJobBackoffFunc(worker Worker, queue, kind string, attempt int64) time.Duration {
+	if retry, ok := worker.(WorkerBackoff); ok {
+		return retry.BackoffForAttemp(queue, kind, attempt)
+	}
+
+	if attempt >= defaultMaxAttempts {
+		return -1
+	}
+
+	return time.Duration(attempt) * time.Minute
+}
+
 // New creates and initializes a Client. If no database option is provided it
 // defaults to a random in-memory database. Returns an error if the database
 // cannot be opened or the schema migration fails.
@@ -133,9 +146,7 @@ func New(ctx context.Context, options ...Option) (*Client, error) {
 	client.workers = make(map[string]Worker)
 	client.pollerBackoff = 1 * time.Second
 	client.maxAttempts = 10
-	client.jobBackoff = func(_, _ string, attempt int64) time.Duration {
-		return time.Duration(attempt) * time.Minute
-	}
+	client.jobBackoff = defaultJobBackoffFunc
 
 	for _, option := range options {
 		if err := option(ctx, client); err != nil {
@@ -376,9 +387,17 @@ func (c *Client) fail(ctx context.Context, jobID int64, timeout time.Duration, i
 	}
 	defer tx.Rollback()
 
+	status := "pending"
+	switch {
+	case timeout < 0:
+		status = "dead"
+	case timeout == 0:
+		status = "finished"
+	}
+
 	const updateJobSQL = `
 	UPDATE "sterling_jobs"
-	SET "status" = 'pending',
+	SET "status" = ?,
 			"visible_at" = unixepoch() + ?,
 			"failure_info" = ?,
 			"claimed_at" = NULL,
@@ -387,7 +406,7 @@ func (c *Client) fail(ctx context.Context, jobID int64, timeout time.Duration, i
 	WHERE id = ?;
 	`
 
-	_, err = tx.ExecContext(ctx, updateJobSQL, int(timeout.Seconds()), info, jobID)
+	_, err = tx.ExecContext(ctx, updateJobSQL, status, int(timeout.Seconds()), info, jobID)
 	if err != nil {
 		return fmt.Errorf("failed to update job: %w", err)
 	}
@@ -693,6 +712,18 @@ func (c *Client) sweepExpiredClaims(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
+func (c *Client) ClearDeadJobs(ctx context.Context) error {
+	const clearSQL = `
+	DELETE FROM "sterling_jobs" WHERE "status" = 'dead';
+	`
+
+	if _, err := c.db.ExecContext(ctx, clearSQL); err != nil {
+		return fmt.Errorf("failed to clear dead jobs: %w", err)
+	}
+
+	return nil
+}
+
 // Drain processes all available jobs from the specified queues until none remain. It blocks until all jobs are processed or ctx is cancelled. This is primarily intended for testing and debugging purposes, allowing you to process all jobs in a controlled manner.
 func (c *Client) Drain(ctx context.Context, queues []string) error {
 	workerID := c.workerID.Add(1)
@@ -757,7 +788,7 @@ func (c *Client) process(ctx context.Context, _, _ int64, claim *jobClaim) error
 	if err != nil {
 		slog.ErrorContext(ctx, "Worker failed to execute job", slog.Int64("job-id", claim.ID), slog.String("error", err.Error()))
 
-		timeout := c.jobBackoff(claim.Queue, claim.Kind, claim.Attempt)
+		timeout := c.jobBackoff(worker, claim.Queue, claim.Kind, claim.Attempt)
 		if err := c.fail(ctx, claim.ID, timeout, err.Error()); err != nil {
 			slog.ErrorContext(ctx, "Failed to mark job as failed", slog.Duration("timeout", timeout), slog.Int64("job-id", claim.ID), slog.String("error", err.Error()))
 		}
